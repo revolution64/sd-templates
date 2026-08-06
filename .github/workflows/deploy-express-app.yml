@@ -1,0 +1,307 @@
+name: Deploy Express App to Hetzner (Reusable)
+
+# This is a reusable workflow that can deploy any Express app
+# Call it from another workflow using:
+#   uses: ./.github/workflows/deploy-express-app.yml
+#   with:
+#     app_name: my-app
+#     domain: my-app.example.com
+#     port: 3008
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: 'Branch to checkout for deployment (leave empty to use the triggering ref)'
+        required: false
+        default: ''
+        type: string
+      app_name:
+        description: 'Unique name for the app (used for container, nginx config, directory)'
+        required: true
+        type: string
+      domain:
+        description: 'Domain name for the app'
+        required: true
+        type: string
+      port:
+        description: 'Port the app runs on inside Docker'
+        required: true
+        type: string
+      host_port:
+        description: 'Port exposed on the host (defaults to same as port)'
+        required: false
+        type: string
+      skip_ssl:
+        description: 'Skip SSL certificate setup'
+        required: false
+        default: false
+        type: boolean
+      environment:
+        description: 'GitHub environment to use for secrets (e.g., dev, production)'
+        required: false
+        default: 'dev'
+        type: string
+    secrets:
+      HETZNER_HOST:
+        required: true
+      HETZNER_USERNAME:
+        required: true
+      HETZNER_SSH_KEY:
+        required: true
+      CERTBOT_EMAIL:
+        required: true
+      APP_ENV_VARS:
+        required: false
+        description: 'Environment variables for .env file (one per line: KEY=value)'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      APP_DIR: /opt/${{ inputs.app_name }}
+      HOST_PORT: ${{ inputs.host_port || inputs.port }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch || github.ref }}
+
+      - name: Validate inputs
+        run: |
+          echo "Deploying ${{ inputs.app_name }}"
+          echo "  Domain: ${{ inputs.domain }}"
+          echo "  Port: ${{ inputs.port }}"
+          echo "  Host Port: ${{ env.HOST_PORT }}"
+          echo "  App Directory: ${{ env.APP_DIR }}"
+
+      # ── Create target directory ──────────────────────────────────────────────
+      - name: Create target directory
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USERNAME }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          script: |
+            mkdir -p ${{ env.APP_DIR }}
+            chmod 755 ${{ env.APP_DIR }}
+            echo "Target directory ${{ env.APP_DIR }} ready"
+
+      # ── Copy repository files to the server ──────────────────────────────────
+      - name: Copy files to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USERNAME }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          source: ".,!.git,!node_modules"
+          target: ${{ env.APP_DIR }}
+          rm: false
+          strip_components: 0
+          overwrite: true
+
+      # ── Create .env file on the server ───────────────────────────────────────
+      - name: Create .env file
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USERNAME }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          script: |
+            cat > ${{ env.APP_DIR }}/.env <<'ENVEOF'
+            ${{ secrets.APP_ENV_VARS }}
+            ENVEOF
+            echo ".env file created"
+
+      # ── Create nginx config templates ────────────────────────────────────────
+      - name: Create nginx configs
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USERNAME }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          script: |
+            APP_DIR="${{ env.APP_DIR }}"
+            DOMAIN="${{ inputs.domain }}"
+            HOST_PORT="${{ env.HOST_PORT }}"
+            
+            mkdir -p "${APP_DIR}/nginx"
+            
+            # HTTP config (for initial cert request)
+            cat > "${APP_DIR}/nginx/http.conf" <<'HTTPEOF'
+            server {
+                listen 80;
+                server_name DOMAIN_PLACEHOLDER;
+
+                location /.well-known/acme-challenge/ {
+                    root /var/www/certbot;
+                }
+
+                location / {
+                    return 301 https://$host$request_uri;
+                }
+            }
+            HTTPEOF
+            
+            # SSL config
+            cat > "${APP_DIR}/nginx/ssl.conf" <<'SSLEOF'
+            server {
+                listen 80;
+                server_name DOMAIN_PLACEHOLDER;
+
+                location /.well-known/acme-challenge/ {
+                    root /var/www/certbot;
+                }
+
+                location / {
+                    return 301 https://$host$request_uri;
+                }
+            }
+
+            server {
+                listen 443 ssl http2;
+                server_name DOMAIN_PLACEHOLDER;
+
+                ssl_certificate     /etc/letsencrypt/live/DOMAIN_PLACEHOLDER/fullchain.pem;
+                ssl_certificate_key /etc/letsencrypt/live/DOMAIN_PLACEHOLDER/privkey.pem;
+
+                ssl_protocols TLSv1.3;
+                ssl_ciphers HIGH:!aNULL:!MD5;
+                ssl_prefer_server_ciphers on;
+                ssl_session_cache shared:SSL:10m;
+                ssl_session_timeout 10m;
+
+                location / {
+                    proxy_pass         http://localhost:PORT_PLACEHOLDER;
+                    proxy_http_version 1.1;
+                    proxy_set_header   Upgrade           $http_upgrade;
+                    proxy_set_header   Connection        "upgrade";
+                    proxy_set_header   Host              $host;
+                    proxy_set_header   X-Real-IP         $remote_addr;
+                    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+                    proxy_set_header   X-Forwarded-Proto $scheme;
+                    proxy_read_timeout 300s;
+                    proxy_send_timeout 300s;
+                    client_max_body_size 50M;
+                }
+            }
+            SSLEOF
+            
+            # Replace placeholders
+            sed -i "s/DOMAIN_PLACEHOLDER/${DOMAIN}/g" "${APP_DIR}/nginx/http.conf"
+            sed -i "s/DOMAIN_PLACEHOLDER/${DOMAIN}/g" "${APP_DIR}/nginx/ssl.conf"
+            sed -i "s/PORT_PLACEHOLDER/${HOST_PORT}/g" "${APP_DIR}/nginx/ssl.conf"
+            
+            echo "Nginx configs created"
+
+      # ── Install Docker, nginx, certbot if needed ─────────────────────────────
+      - name: Install dependencies
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USERNAME }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          script: |
+            # Docker
+            if ! command -v docker &>/dev/null; then
+              echo "Installing Docker..."
+              curl -fsSL https://get.docker.com | sh
+              systemctl enable --now docker
+            fi
+
+            # nginx
+            if ! command -v nginx &>/dev/null; then
+              echo "Installing nginx..."
+              apt-get update -qq
+              apt-get install -y nginx
+              systemctl enable nginx
+            fi
+
+            # certbot
+            if ! command -v certbot &>/dev/null; then
+              echo "Installing certbot..."
+              apt-get update -qq
+              apt-get install -y certbot python3-certbot-nginx
+            fi
+            
+            echo "Dependencies ready"
+
+      # ── Build and start Docker container ─────────────────────────────────────
+      - name: Build and start application
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USERNAME }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          script: |
+            cd ${{ env.APP_DIR }}
+            docker compose down --remove-orphans 2>&1 || true
+            docker compose build --no-cache 2>&1
+            docker compose up -d 2>&1
+            echo "Container started"
+
+      # ── Configure nginx and SSL ──────────────────────────────────────────────
+      - name: Configure nginx and SSL
+        if: ${{ !inputs.skip_ssl }}
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USERNAME }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          script_stop: false
+          script: |
+            APP_NAME="${{ inputs.app_name }}"
+            DOMAIN="${{ inputs.domain }}"
+            CERTBOT_EMAIL="${{ secrets.CERTBOT_EMAIL }}"
+            APP_DIR="${{ env.APP_DIR }}"
+            NGINX_CONF="/etc/nginx/sites-available/${APP_NAME}"
+            CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
+
+            mkdir -p /var/www/certbot
+
+            # Start with HTTP-only config
+            cp "${APP_DIR}/nginx/http.conf" "$NGINX_CONF"
+            ln -sf "$NGINX_CONF" "/etc/nginx/sites-enabled/${APP_NAME}"
+            rm -f /etc/nginx/sites-enabled/default
+
+            nginx -t 2>&1 || true
+            systemctl reload nginx 2>&1 || true
+
+            # Get certificate if needed
+            if [ ! -d "$CERT_DIR" ]; then
+              echo "Requesting certificate for ${DOMAIN}..."
+              certbot certonly \
+                --webroot \
+                --webroot-path /var/www/certbot \
+                --non-interactive \
+                --agree-tos \
+                --email "${CERTBOT_EMAIL}" \
+                -d "${DOMAIN}" 2>&1 || true
+            else
+              echo "Certificate exists, attempting renewal..."
+              certbot renew --quiet 2>&1 || true
+            fi
+
+            # Switch to SSL config
+            cp "${APP_DIR}/nginx/ssl.conf" "$NGINX_CONF"
+
+            # Setup auto-renewal cron
+            CRON_JOB="0 3 * * * certbot renew --quiet && systemctl reload nginx"
+            ( crontab -l 2>/dev/null | grep -v "certbot renew" ; echo "$CRON_JOB" ) | crontab - 2>&1 || true
+
+            nginx -t 2>&1 || true
+            systemctl reload nginx 2>&1 || true
+            
+            echo "Deployment complete: https://${DOMAIN}"
+            exit 0
+
+      - name: Deployment summary
+        run: |
+          echo "✅ Deployment complete!"
+          echo ""
+          echo "App: ${{ inputs.app_name }}"
+          echo "URL: https://${{ inputs.domain }}"
+          echo "Port: ${{ env.HOST_PORT }}"
+          echo "Directory: ${{ env.APP_DIR }}"
