@@ -7,6 +7,10 @@ name: Deploy Express App to Hetzner (Reusable)
 #     app_name: my-app
 #     domain: my-app.example.com
 #     port: 3008
+#
+# For monorepos, set `app_path` to the subdirectory holding the app's
+# Dockerfile / docker-compose.yml, e.g.:
+#     app_path: apps/my-app
 
 on:
   workflow_call:
@@ -31,6 +35,11 @@ on:
       host_port:
         description: 'Port exposed on the host (defaults to same as port)'
         required: false
+        type: string
+      app_path:
+        description: 'Path within the repository containing the app (monorepo support). Empty means repository root.'
+        required: false
+        default: ''
         type: string
       skip_ssl:
         description: 'Skip SSL certificate setup'
@@ -62,6 +71,7 @@ jobs:
     env:
       APP_DIR: /opt/${{ inputs.app_name }}
       HOST_PORT: ${{ inputs.host_port || inputs.port }}
+      COMPOSE_DIR: /opt/${{ inputs.app_name }}${{ inputs.app_path && format('/{0}', inputs.app_path) || '' }}
 
     steps:
       - name: Checkout code
@@ -76,6 +86,7 @@ jobs:
           echo "  Port: ${{ inputs.port }}"
           echo "  Host Port: ${{ env.HOST_PORT }}"
           echo "  App Directory: ${{ env.APP_DIR }}"
+          echo "  Compose Directory: ${{ env.COMPOSE_DIR }}"
 
       # ── Create target directory ──────────────────────────────────────────────
       - name: Create target directory
@@ -110,7 +121,9 @@ jobs:
           username: ${{ secrets.HETZNER_USERNAME }}
           key: ${{ secrets.HETZNER_SSH_KEY }}
           script: |
-            cat > ${{ env.APP_DIR }}/.env <<'ENVEOF'
+            mkdir -p ${{ env.COMPOSE_DIR }}
+            chmod 755 ${{ env.APP_DIR }}
+            cat > ${{ env.COMPOSE_DIR }}/.env <<'ENVEOF'
             ${{ secrets.APP_ENV_VARS }}
             ENVEOF
             echo ".env file created"
@@ -236,7 +249,7 @@ jobs:
           username: ${{ secrets.HETZNER_USERNAME }}
           key: ${{ secrets.HETZNER_SSH_KEY }}
           script: |
-            cd ${{ env.APP_DIR }}
+            cd ${{ env.COMPOSE_DIR }}
             docker compose down --remove-orphans 2>&1 || true
             docker compose build --no-cache 2>&1
             docker compose up -d 2>&1
@@ -305,3 +318,4 @@ jobs:
           echo "URL: https://${{ inputs.domain }}"
           echo "Port: ${{ env.HOST_PORT }}"
           echo "Directory: ${{ env.APP_DIR }}"
+          echo "Compose directory: ${{ env.COMPOSE_DIR }}"
